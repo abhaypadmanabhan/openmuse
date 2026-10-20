@@ -18,7 +18,7 @@ import { BrowserService } from "./browser.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import type { DesktopComputer } from "./computer-backend.ts";
 import { computerRoutes } from "./computer-routes.ts";
-import { viewerAssets } from "./computer-viewer.ts";
+import { viewerAssets, viewerPath } from "./computer-viewer.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
@@ -136,11 +136,15 @@ export async function createApp(
   });
   app.use("/api/*", async (c, next) => {
     const signedRoute =
-      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$|^\/api\/computer\/desktop\/viewer$/.test(
+      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
         c.req.path,
       );
-    const owner =
-      signedRoute && c.req.query("signature")
+    // The desktop viewer sends its signed credential in a header, so it never sits in a
+    // request line that a proxy or host logs.
+    const viewer = c.req.path === viewerPath ? c.req.header("x-openmuse-viewer") : undefined;
+    const owner = viewer
+      ? auth.verify(new URL(`${viewerPath}?${viewer}`, config.publicUrl))
+      : signedRoute && c.req.query("signature")
         ? auth.verify(new URL(c.req.url))
         : await auth.owner(c.req.header("authorization"));
     c.set("owner", owner);

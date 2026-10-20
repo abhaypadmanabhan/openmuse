@@ -56,6 +56,12 @@ async function server(provider: "orgo" | "e2b-desktop" = "orgo") {
   };
 }
 const path = (url: string) => url.replace("http://localhost:8787", "");
+// What the viewer page sends: its credential in a header, never in the URL.
+const post = (s: Awaited<ReturnType<typeof server>>, credential: string) =>
+  s.app.request("/api/computer/desktop/viewer", {
+    method: "POST",
+    headers: { "X-OpenMuse-Viewer": credential },
+  });
 
 test("the desktop link opens a public viewer page with its signed credential in the fragment", async () => {
   const s = await server();
@@ -80,12 +86,8 @@ test("the desktop link opens a public viewer page with its signed credential in 
         "connect-src 'self' wss://staging.orgo.ai; frame-ancestors 'self' http://localhost:8081 " +
         "http://localhost:8787; base-uri 'none'; form-action 'none'",
     );
-    // The fragment's credential is the one the POST below accepts.
-    const credential = url.split("#")[1];
-    const answer = await s.app.request(`/api/computer/desktop/viewer?${credential}`, {
-      method: "POST",
-    });
-    assert.equal(answer.status, 200);
+    // The fragment's credential is the one the viewer's POST accepts.
+    assert.equal((await post(s, url.split("#")[1])).status, 200);
   } finally {
     await s.close();
   }
@@ -95,7 +97,8 @@ test("only the signed credential gets the socket and password, and only for its 
   const s = await server();
   try {
     const signed = path(s.auth.sign("local-user", "/api/computer/desktop/viewer"));
-    const answer = await s.app.request(signed, { method: "POST" });
+    const credential = signed.split("?")[1];
+    const answer = await post(s, credential);
     assert.equal(answer.status, 200);
     assert.deepEqual(await answer.json(), {
       socket: "wss://staging.orgo.ai/desktops/c1/ws/websockify",
@@ -107,21 +110,18 @@ test("only the signed credential gets the socket and password, and only for its 
       (await s.app.request("/api/computer/desktop/viewer", { method: "POST" })).status,
       401,
     );
+    // In the URL the credential is refused: request lines end up in proxy and host logs.
+    assert.equal((await s.app.request(signed, { method: "POST" })).status, 401);
     // A tampered signature, and a valid signature for another path.
-    const tampered = signed.replace(
+    const tampered = credential.replace(
       /signature=(\w)/,
       (_, c) => `signature=${c === "a" ? "b" : "a"}`,
     );
-    assert.equal((await s.app.request(tampered, { method: "POST" })).status, 403);
+    assert.equal((await post(s, tampered)).status, 403);
     const other = new URL(s.auth.sign("local-user", "/api/files/x/content"));
-    assert.equal(
-      (await s.app.request(`/api/computer/desktop/viewer${other.search}`, { method: "POST" }))
-        .status,
-      403,
-    );
+    assert.equal((await post(s, other.search.slice(1))).status, 403);
     // An expired credential.
-    const expired = signed.replace(/expires=\d+/, "expires=1000");
-    assert.equal((await s.app.request(expired, { method: "POST" })).status, 401);
+    assert.equal((await post(s, credential.replace(/expires=\d+/, "expires=1000"))).status, 401);
   } finally {
     await s.close();
   }
@@ -201,16 +201,18 @@ function viewer(t: TestContext, hash = "#owner=o&expires=9&signature=s") {
   const screens: (Target & { target: Element; disconnected: boolean; disconnect(): void })[] = [];
   const posts: {
     url: string;
+    credential: string;
     signal: AbortSignal;
     answer: (status: number, body: unknown, held?: boolean) => void;
   }[] = [];
   const window = new Target();
   const location = { hash };
-  const fetch = (url: string, init: { signal: AbortSignal }) =>
+  const fetch = (url: string, init: { signal: AbortSignal; headers: Record<string, string> }) =>
     new Promise((resolve, reject) => {
       init.signal.addEventListener("abort", () => reject(new Error("aborted")));
       posts.push({
         url,
+        credential: init.headers["X-OpenMuse-Viewer"],
         signal: init.signal,
         // A held body is still being read when the answer arrives; aborting fails it.
         answer: (status, body, held = false) =>
@@ -277,7 +279,8 @@ const tick = async (t: TestContext, ms: number) => {
 
 test("the viewer connects with its fragment credential, and an idle close waits for Reconnect", async (t) => {
   const v = viewer(t);
-  assert.equal(v.posts[0].url, "../api/computer/desktop/viewer?owner=o&expires=9&signature=s");
+  assert.equal(v.posts[0].url, "../api/computer/desktop/viewer");
+  assert.equal(v.posts[0].credential, "owner=o&expires=9&signature=s");
   await v.answer();
   assert.equal(v.sockets[0].url, "wss://orgo.test/desktops/c1/ws/websockify?token=p%20w");
   assert.deepEqual(v.screen.children, [v.screens[0].target]);
@@ -309,7 +312,7 @@ test("a transient close reconnects with a fresh password and the renewed credent
   assert.match(v.status.textContent, /Reconnecting/);
   await tick(t, 1000);
   assert.equal(v.posts.length, 2);
-  assert.equal(v.posts[1].url, "../api/computer/desktop/viewer?renewed");
+  assert.equal(v.posts[1].credential, "renewed");
   await v.answer(200, { socket: "wss://orgo.test/s", password: "second" });
   assert.equal(v.sockets[1].url, "wss://orgo.test/s?token=second");
   v.screens[1].emit("connect");
@@ -380,7 +383,26 @@ test("an expired credential stops with a message, and a renewed one reconnects",
   v.location.hash = "#renewed";
   v.window.emit("hashchange");
   assert.equal(v.posts.length, 2);
-  assert.equal(v.posts[1].url, "../api/computer/desktop/viewer?renewed");
+  assert.equal(v.posts[1].credential, "renewed");
+});
+
+test("a renewal that arrives while the old credential is being refused is tried at once", async (t) => {
+  for (const status of [401, 403]) {
+    const v = viewer(t);
+    v.location.hash = "#renewed";
+    v.window.emit("hashchange");
+    // Still connecting: the renewal is only kept.
+    assert.equal(v.posts.length, 1);
+    await v.answer(status, { error: "Invalid access link" });
+    assert.equal(v.posts.length, 2);
+    assert.equal(v.posts[1].credential, "renewed");
+    // The renewed credential is refused too: stop, no loop.
+    await v.answer(status, { error: "Invalid access link" });
+    await tick(t, 60_000);
+    assert.equal(v.posts.length, 2);
+    assert.match(v.status.textContent, /link has expired/);
+    t.mock.timers.reset();
+  }
 });
 
 test("a page opened without a credential asks to be opened from OpenMuse", (t) => {

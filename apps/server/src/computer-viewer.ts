@@ -6,8 +6,9 @@ import type { Config } from "./config.ts";
 /** OpenMuse's own desktop viewer, for providers without a hosted page (Orgo). The page
  * (`pagePath`) is public and holds no secret. Its link carries a signed credential for
  * `viewerPath` in the fragment, which browsers never send to a server; on each connect the
- * page POSTs it to `viewerPath` for the socket and password. The app asks for a new link
- * every 2 minutes; it differs only in the fragment, so an open viewer takes it in place. */
+ * page POSTs it to `viewerPath`, in a header, for the socket and password. The app asks for
+ * a new link every 2 minutes; it differs only in the fragment, so an open viewer takes it in
+ * place. */
 export const viewerPath = "/api/computer/desktop/viewer";
 const assetsPath = "/computer-viewer";
 const pagePath = `${assetsPath}/desktop`;
@@ -115,15 +116,18 @@ async function connect() {
   stop(); // one connection at a time
   expired = false;
   if (!credential) return say("Open the desktop from OpenMuse.");
-  const mine = attempt;
+  const mine = attempt, sent = credential;
   say("Connecting to the desktop…");
   const controller = (pending = new AbortController());
   let target;
   try {
-    const response = await fetch("..${viewerPath}?" + credential, { method: "POST", cache: "no-store", signal: controller.signal });
+    // In a header, never the URL: request lines end up in proxy and host logs.
+    const response = await fetch("..${viewerPath}", { method: "POST", cache: "no-store", headers: { "X-OpenMuse-Viewer": credential }, signal: controller.signal });
     const body = await response.json().catch(() => ({}));
     if (mine !== attempt) return;
     if (response.status === 401 || response.status === 403) {
+      // A renewal that arrived while this answer was on its way gets its own try.
+      if (credential !== sent) return connect();
       expired = true;
       return say("This desktop link has expired. Open the desktop again from OpenMuse.");
     }
