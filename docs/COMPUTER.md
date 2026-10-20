@@ -86,16 +86,6 @@ With this provider the agent gets one more tool, `use_desktop`, in chat and in d
 
 When the agent uses `use_desktop`, the chat shows a **Desktop** card for each step with what it did. A persistent viewer after the tool cards embeds the live desktop, so new steps preserve the VNC connection. The per-step cards show their action labels. On web the viewer embeds the same stream as the Desktop tab. On iOS and Android it shows the latest screenshot and an **Open desktop** button. When the computer is stopped, the card says it is offline and offers **Start computer**. **Open in Desktop tab** opens the computer sheet on its Desktop tab.
 
-## Work with files
-
-- **Computer → Files** lists the persistent `/workspace` directory. Create folders, add text files, edit them, and save.
-- **Copy a document here** copies an owned PDF from OpenMuse into the current folder. A matching filename is replaced.
-- Open a PDF in the workspace to save a copy to OpenMuse Documents and view it in the native/web reader.
-- Browser downloads first enter Documents through **Import PDF downloads**, then can be copied into the Linux workspace.
-- Stopping the computer ends its running commands and keeps the named workspace volume. Starting it again restores those files.
-
-The terminal runs bounded commands and displays their saved results. It is not an interactive PTY: full-screen terminal apps and prompts that require ongoing keyboard input are not supported. Write noninteractive scripts or edit files through the Files tab.
-
 ### Run the computer on Orgo (optional)
 
 Each owner's computer can instead be an [Orgo](https://docs.orgo.ai) cloud computer: a Linux VM with a graphical desktop, Google Chrome, Python 3, Node and git. The API host needs no Docker engine. Create a dedicated Orgo workspace for OpenMuse and an API key for it, then set:
@@ -109,18 +99,29 @@ COMPUTER_DEPLOYMENT_ID=...     # required and unique per install, e.g. `openssl 
 # ORGO_BASE_URL=...            # only for a non-default Orgo API
 ```
 
-Open **Computer → Start computer**. The agent gets the same `use_desktop` tool as on E2B, and the terminal and Files tabs work as usual. The Desktop tab is not shown: Orgo has no embeddable live-view URL yet (see the differences below). The agent's screenshots are kept per action and served at `GET /api/computer/desktop/screenshot`.
+Open **Computer → Start computer**. The agent gets the same `use_desktop` tool as on E2B, and the terminal and Files tabs work as usual. The Desktop tab is not shown: Orgo has no embeddable live-view URL yet (see the differences below). The chat's Desktop card shows the screenshot each step saved, on web and native, with no **Open desktop** or **Open in Desktop tab** button. The latest screenshot is served at `GET /api/computer/desktop/screenshot`.
 
 How it maps to the Docker contract:
 
 - **One computer per owner and deployment**, found by name in `ORGO_WORKSPACE_ID`. Orgo has no labels, so the name is `openmuse-<deployment hash>-<owner hash>`; use a workspace that OpenMuse owns. That is why `COMPUTER_DEPLOYMENT_ID` is required.
-- **`/workspace` persists; processes do not.** Stop is Orgo's stop: the disk is archived and the host released, every command and desktop app ends, and files are kept. Start restores the disk. Each takes about 40 seconds. A computer that Orgo suspended for idleness counts as running and wakes on its next action.
+- **`/workspace` persists; processes do not.** Stop is Orgo's stop: the disk is archived and the host released, every command and desktop app ends, and files are kept. Start restores the disk. Each usually takes about 40 seconds; OpenMuse waits up to 5 minutes and keeps the computer locked meanwhile. A computer that Orgo suspended for idleness counts as running and wakes on its next action; Stop wakes it first, because Orgo stops only a running computer.
+- **Busy computers refuse work.** While Orgo is creating, restarting or updating the computer, or has not settled a start or stop (including one still running after those 5 minutes), commands, actions, Start and Stop answer "try again in a minute". A computer in Orgo's error state is refused; check it in the Orgo dashboard.
 - **Idle shutdown.** Start asks Orgo to suspend the computer after 15 idle minutes (`auto_stop_minutes`). Orgo applies this on plans that offer it; where it is refused, the computer keeps running and billing until you press Stop.
 - **Commands** run as `root` in `/workspace`, with the same 30-second limit, exit code 124 on timeout and 128 KB output cap. Orgo's shell endpoint has no stdin and merges the two output streams, so every command runs inside a small wrapper that splits them again and feeds stdin from uploaded files. File operations reuse `apps/computer/files.py` this way; a PDF near the 10 MB limit goes up in 8 MB parts.
 - **GUI apps from the terminal.** The desktop is on display `:99`, so `google-chrome --no-sandbox https://copilotkit.ai >/dev/null 2>&1 &` opens on it. A backgrounded app does not keep the command open. Orgo's Chrome asks to accept Google's terms on its first launch; the agent or user accepts it once per computer.
 - **Desktop actions** use Orgo's click, type, key, scroll and mouse-move endpoints, then take a 1280x800 JPEG screenshot. Sideways scroll and a click or scroll at the current pointer have no endpoint and run through `xdotool` on the same display.
 - **Command history is per provider**, separate from Docker and E2B.
 - **Run the live test** with `ORGO_API_KEY=... ORGO_WORKSPACE_ID=... pnpm test:computer:orgo`. It creates one computer in that workspace, exercises every path above and deletes the computer. Set `ORGO_SMOKE_SCREENSHOT_DIR` to keep the screenshots it takes.
+
+## Work with files
+
+- **Computer → Files** lists the persistent `/workspace` directory. Create folders, add text files, edit them, and save.
+- **Copy a document here** copies an owned PDF from OpenMuse into the current folder. A matching filename is replaced.
+- Open a PDF in the workspace to save a copy to OpenMuse Documents and view it in the native/web reader.
+- Browser downloads first enter Documents through **Import PDF downloads**, then can be copied into the Linux workspace.
+- Stopping the computer ends its running commands and keeps the named workspace volume. Starting it again restores those files.
+
+The terminal runs bounded commands and displays their saved results. It is not an interactive PTY: full-screen terminal apps and prompts that require ongoing keyboard input are not supported. Write noninteractive scripts or edit files through the Files tab.
 
 ## Isolation and scope
 
@@ -141,8 +142,8 @@ The Orgo provider differs from Docker in these ways:
 
 - **Network access is on.** Commands can reach the internet and the app reports `network: enabled`. The same outbound-path warning as E2B applies: approval gating covers only the app's own email and calendar tools.
 - **Isolation comes from the VM**, one per owner. Commands run as `root` inside it, with no read-only root filesystem, capability drop or pids limit.
-- **No live view.** Anyone with Orgo workspace access can watch the computer in the Orgo dashboard; OpenMuse does not embed it, so no VNC credential reaches the client.
-- **A command cannot be cancelled.** Orgo's shell endpoint has no kill. Aborting a command stops OpenMuse waiting and records it as interrupted, and the in-VM 30-second timeout is what ends it.
+- **No live view.** Every member of the Orgo workspace can watch the computer in the Orgo dashboard, and members with write access can also control it; OpenMuse does not embed the view, so no VNC credential reaches the client.
+- **Aborting a command stops the whole computer.** Orgo's shell endpoint has no kill, so an aborted command, or one whose response is lost, is recorded as interrupted and the computer is stopped, as on Docker and E2B: every other command and desktop app on it ends too, and files are kept. If that Stop cannot be confirmed, the computer stays locked until a Stop succeeds.
 - **Files live with Orgo.** Workspace files are stored with Orgo, outside your host. Your Orgo plan's limits apply.
 
 The Orgo API key stays on the API host.

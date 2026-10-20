@@ -262,7 +262,7 @@ export class ComputerService {
   ) {
     const lease = await this.acquire(owner, kind);
     try {
-      return await operation(lease);
+      return await this.holding(owner, lease.token, () => operation(lease));
     } finally {
       // A stopped command must acknowledge completion before a new lifecycle can
       // begin. A delayed Docker client can otherwise exec into a restarted box.
@@ -282,6 +282,35 @@ export class ComputerService {
         { expiresAt: 0 },
       );
       await this.releaseStopped(owner, lease.token);
+    }
+  }
+  // Lifecycle work can outlast one lease: an Orgo stop archives the disk, sometimes for
+  // minutes. The holder renews its lease while the work runs, so the lease never lapses
+  // under live work, and a crashed process stops renewing. Renewal ends before the
+  // holder releases, so it cannot revive a released lease.
+  private async holding<T>(owner: string, token: string, work: () => Promise<T>) {
+    let renewal = Promise.resolve();
+    const timer = setInterval(() => {
+      renewal = renewal
+        .then(() =>
+          this.db.compareAndSwap(
+            owner,
+            "computer-state",
+            "lease",
+            { token },
+            { expiresAt: Date.now() + leaseDuration },
+          ),
+        )
+        .then(
+          () => undefined,
+          () => undefined,
+        );
+    }, leaseDuration / 3);
+    try {
+      return await work();
+    } finally {
+      clearInterval(timer);
+      await renewal;
     }
   }
   private async releaseStopped(owner: string, token: string) {
@@ -393,7 +422,7 @@ export class ComputerService {
               stderr: "Stopped by the user. Inspect the workspace before repeating this command.",
             },
           );
-      await this.backend.stop(owner);
+      await this.holding(owner, lease.token, () => this.backend.stop(owner));
       await this.db.compareAndSwap(
         owner,
         "computer-state",

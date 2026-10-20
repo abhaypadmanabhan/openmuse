@@ -11,14 +11,27 @@ const orgoBase = "https://www.orgo.ai/api";
 const display = ":99"; // Orgo's boot screen
 const controlMs = 10_000;
 const createMs = 120_000;
-// stop and start archive or restore the disk and run synchronously (about 40 seconds).
-const lifecycleMs = 180_000;
+// stop and start archive or restore the disk as Orgo operations (often about 40 seconds,
+// sometimes minutes); this bounds the whole wait for one, like Orgo's own synchronous limit.
+const lifecycleMs = 300_000;
 const idleMinutes = 15; // Orgo suspends an idle computer itself; each operation counts as activity
 // POST /files/upload accepts 10 MB per file; larger stdin goes up in parts.
 const uploadPart = 8 * 1024 * 1024;
 const inbox = "/tmp/openmuse-in";
 const screenshotQuality = 80;
 const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+// Every status GET /computers/{id} documents. Suspended computers wake on their next
+// action; frozen is Stop and stopped is a VM that went away, both started again by Start.
+// error and anything undocumented are refused.
+const statuses = new Map<string, "running" | "suspended" | "paused" | "busy">([
+  ["running", "running"],
+  ["suspended", "suspended"],
+  ["frozen", "paused"],
+  ["stopped", "paused"],
+  ["creating", "busy"],
+  ["restarting", "busy"],
+  ["updating", "busy"],
+]);
 
 export interface OrgoInfo {
   id: string;
@@ -32,13 +45,15 @@ export interface OrgoBashResult {
 export type OrgoInput = "click" | "type" | "key" | "scroll" | "mouse-move";
 /** The slice of the Orgo REST API this provider uses; tests replace it with a fake. */
 export interface OrgoDriver {
-  /** The computer with this name in the configured workspace. Names are unique there. */
-  find(name: string): Promise<OrgoInfo | undefined>;
+  /** Every computer with this name in the configured workspace. */
+  list(name: string): Promise<OrgoInfo[]>;
   create(name: string): Promise<string>;
   /** Boot a stopped computer from its archived disk. */
   start(id: string): Promise<void>;
   /** Archive the disk and release the host: files stay, processes end. */
   stop(id: string): Promise<void>;
+  /** Whether a start or stop this driver began for the computer has not settled yet. */
+  pending(id: string): Promise<boolean>;
   autoStop(id: string, minutes: number): Promise<void>;
   bash(
     id: string,
@@ -60,8 +75,14 @@ class OrgoError extends Error {
   }
 }
 
-// `fetcher` is the global fetch; tests pass a fake.
-export function orgoDriver(config: Config, fetcher: typeof fetch = fetch): OrgoDriver {
+// `fetcher` is the global fetch, `pollMs` the operation poll interval and `budgetMs` the
+// bound on one start or stop; tests pass fakes.
+export function orgoDriver(
+  config: Config,
+  fetcher: typeof fetch = fetch,
+  pollMs = 2000,
+  budgetMs = lifecycleMs,
+): OrgoDriver {
   const base = (config.orgoBaseUrl ?? orgoBase).replace(/\/+$/, "");
   const headers = { Authorization: `Bearer ${config.orgoApiKey}` };
   const request = async (path: string, init: RequestInit = {}, timeoutMs = controlMs) => {
@@ -95,11 +116,57 @@ export function orgoDriver(config: Config, fetcher: typeof fetch = fetch): OrgoD
     if (!config.orgoWorkspaceId) throw new OrgoError(0, "ORGO_WORKSPACE_ID is not set");
     return config.orgoWorkspaceId;
   };
+  // A synchronous start or stop answers 202 once Orgo's own wait runs out, so both run
+  // as operations and are polled until they settle. 200 means it was already done.
+  // An operation still running at the deadline, or in needs_review, stays recorded so
+  // `pending` keeps new work away until Orgo settles it.
+  const unsettled = new Map<string, string>();
+  const operation = async (id: string, operationId: string, timeoutMs = controlMs) => {
+    const poll = await request(
+      `/computers/${id}/operations/${encodeURIComponent(operationId)}`,
+      {},
+      timeoutMs,
+    );
+    const { status } = (await poll.json()) as { status?: string };
+    if (status === "succeeded" || status === "failed") unsettled.delete(id);
+    return { status, code: poll.status };
+  };
+  const lifecycle = async (id: string, action: "start" | "stop") => {
+    const deadline = Date.now() + budgetMs;
+    const left = () => deadline - Date.now();
+    // Each request and sleep fits in what is left, so a late answer cannot overrun it.
+    const bound = () => Math.max(1, Math.min(controlMs, left()));
+    // An answer that arrives after the deadline is not accepted either: the caller has
+    // stopped waiting, and a retry finds the computer's settled state.
+    const inTime = () => {
+      if (left() < 0) throw new OrgoError(0, `Orgo ${action} is still running`);
+    };
+    const response = await json(
+      `/computers/${id}/${action}?async=true`,
+      "POST",
+      undefined,
+      bound(),
+    );
+    if (response.status !== 202) return inTime();
+    const { operation_id } = (await response.json()) as { operation_id?: string };
+    if (!operation_id) throw new OrgoError(202, `Orgo returned no ${action} operation`);
+    unsettled.set(id, operation_id);
+    for (;;) {
+      if (left() <= 0) throw new OrgoError(0, `Orgo ${action} is still running`);
+      const { status, code } = await operation(id, operation_id, bound());
+      if (status === "succeeded") return inTime();
+      if (status !== "queued" && status !== "running")
+        throw new OrgoError(code, `Orgo ${action} ended as ${status}`);
+      await new Promise((done) => setTimeout(done, Math.min(pollMs, Math.max(0, left()))));
+    }
+  };
   return {
-    async find(name) {
+    async list(name) {
       const response = await request(`/workspaces/${encodeURIComponent(workspace())}`);
       const body = (await response.json()) as { desktops?: OrgoInfo[] };
-      return (body.desktops ?? []).find((item) => item.name === name && item.status !== "deleted");
+      return (body.desktops ?? []).filter(
+        (item) => item.name === name && item.status !== "deleted",
+      );
     },
     async create(name) {
       const response = await json(
@@ -115,11 +182,22 @@ export function orgoDriver(config: Config, fetcher: typeof fetch = fetch): OrgoD
       );
       return ((await response.json()) as { id: string }).id;
     },
-    async start(id) {
-      await json(`/computers/${id}/start`, "POST", undefined, lifecycleMs);
-    },
-    async stop(id) {
-      await json(`/computers/${id}/stop`, "POST", undefined, lifecycleMs);
+    start: (id) => lifecycle(id, "start"),
+    stop: (id) => lifecycle(id, "stop"),
+    async pending(id) {
+      const operationId = unsettled.get(id);
+      if (!operationId) return false;
+      try {
+        const { status } = await operation(id, operationId);
+        return status !== "succeeded" && status !== "failed";
+      } catch (error) {
+        // Orgo forgets an operation once it is settled and gone.
+        if (error instanceof OrgoError && error.status === 404) {
+          unsettled.delete(id);
+          return false;
+        }
+        throw error;
+      }
     },
     async autoStop(id, minutes) {
       await json(`/computers/${id}/resize`, "PATCH", { auto_stop_minutes: minutes });
@@ -222,26 +300,50 @@ export class OrgoDesktopComputer implements DesktopComputer {
       );
     }
   }
-  async inspect(
-    labels: Record<string, string>,
-  ): Promise<(DesktopStatus & { id: string }) | undefined> {
-    const info = await this.control(() => this.driver.find(this.name(labels)));
-    if (!info) return undefined;
-    if (info.status === "error")
+  // The workspace record, refused unless it is unambiguously ours and in a known state.
+  private async find(labels: Record<string, string>) {
+    const found = await this.control(() => this.driver.list(this.name(labels)));
+    if (!found.length) return undefined;
+    // Fail closed like E2B: two computers with one owner's name are not ours to pick from.
+    if (found.length > 1)
       throw new AppError(
-        "The Orgo computer is in an error state. Check it in the Orgo dashboard.",
+        "Computer ownership or isolation does not match this deployment; refusing to attach",
+        409,
+      );
+    const info = found[0];
+    const kind = statuses.get(info.status);
+    if (kind === "busy")
+      throw new AppError(`The Orgo computer is ${info.status}. Try again in a minute.`, 409);
+    if (!kind)
+      throw new AppError(
+        info.status === "error"
+          ? "The Orgo computer is in an error state. Check it in the Orgo dashboard."
+          : "The Orgo computer reports an unknown status. Check it in the Orgo dashboard.",
         502,
       );
-    // frozen is Stop; stopped is a VM that went away. Suspended computers wake on
-    // their next action, so they count as running.
+    return { ...info, kind };
+  }
+  /** The computer, if work may be sent to it now. */
+  async inspect(
+    labels: Record<string, string>,
+  ): Promise<(DesktopStatus & { id: string; suspended: boolean }) | undefined> {
+    const info = await this.find(labels);
+    if (!info) return undefined;
+    // A start or stop Orgo has not settled yet: its outcome is unknown, so nothing runs.
+    if (await this.control(() => this.driver.pending(info.id)))
+      throw new AppError(
+        "Orgo is still starting or stopping this computer. Try again in a minute.",
+        409,
+      );
     return {
       id: info.id,
-      state: info.status === "frozen" || info.status === "stopped" ? "paused" : "running",
+      state: info.kind === "paused" ? "paused" : "running",
+      suspended: info.kind === "suspended",
     };
   }
   async state(labels: Record<string, string>): Promise<ComputerState> {
-    const info = await this.inspect(labels);
-    return !info ? "missing" : info.state === "running" ? "running" : "stopped";
+    const info = await this.find(labels);
+    return !info ? "missing" : info.kind === "paused" ? "stopped" : "running";
   }
   async start(labels: Record<string, string>) {
     const existing = await this.inspect(labels);
@@ -260,7 +362,18 @@ export class OrgoDesktopComputer implements DesktopComputer {
   }
   async stop(labels: Record<string, string>) {
     const info = await this.inspect(labels);
-    if (info?.state === "running") await this.control(() => this.driver.stop(info.id));
+    if (info?.state !== "running") return;
+    // Orgo stops only a running computer, and a suspended one resumes on interaction,
+    // not through start. Wake it with a no-op command and check before archiving.
+    if (info.suspended) {
+      await this.control(() => this.driver.bash(info.id, "true", 30)).catch(() => undefined);
+      if ((await this.find(labels))?.kind !== "running")
+        throw new AppError(
+          "The Orgo computer is suspended and did not wake to stop. Try Stop again in a minute.",
+          503,
+        );
+    }
+    await this.control(() => this.driver.stop(info.id));
   }
   private async running(labels: Record<string, string>, verified?: DesktopStatus) {
     const info =

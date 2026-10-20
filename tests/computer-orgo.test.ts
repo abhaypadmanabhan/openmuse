@@ -38,6 +38,11 @@ function fake(
     inputFails?: boolean;
     screenshotFails?: boolean;
     autoStopFails?: boolean;
+    /** Stop resolves only once this does, like a long Orgo archive. */
+    stopGate?: Promise<void>;
+    /** A suspended computer ignores the wake-up command. */
+    staysSuspended?: boolean;
+    pending?: () => boolean;
   } = {},
 ) {
   const computers = new Map<string, OrgoInfo>();
@@ -57,27 +62,41 @@ function fake(
     return id;
   };
   const driver: OrgoDriver = {
-    async find(name) {
-      return [...computers.values()].find((item) => item.name === name);
+    async list(name) {
+      return [...computers.values()].filter((item) => item.name === name);
     },
     async create(name) {
       calls.create.push(name);
       return add({ name });
     },
+    // Orgo's own rules (computers/start, computers/stop): anything else is a 409.
     async start(id) {
       calls.start.push(id);
-      (computers.get(id) as OrgoInfo).status = "running";
+      const info = computers.get(id) as OrgoInfo;
+      if (!["frozen", "stopped", "running"].includes(info.status))
+        throw new Error(`409 not_startable (status: ${info.status})`);
+      info.status = "running";
     },
     async stop(id) {
       calls.stop.push(id);
-      (computers.get(id) as OrgoInfo).status = "frozen";
+      const info = computers.get(id) as OrgoInfo;
+      if (info.status !== "running" && info.status !== "frozen")
+        throw new Error(`409 not_stoppable (status: ${info.status})`);
+      await options.stopGate;
+      info.status = "frozen";
+    },
+    async pending() {
+      return options.pending?.() ?? false;
     },
     async autoStop(id, minutes) {
       calls.autoStop.push({ id, minutes });
       if (options.autoStopFails) throw new Error("plan does not allow auto-stop");
     },
-    async bash(_id, command, timeout) {
+    async bash(id, command, timeout) {
       calls.bash.push({ command, timeout });
+      // Any interaction resumes a suspended computer.
+      const info = computers.get(id);
+      if (info?.status === "suspended" && !options.staysSuspended) info.status = "running";
       const scripted = options.bash?.(command);
       if (scripted) return scripted;
       if (command.startsWith("mkdir -p /workspace")) return { output: "", exitCode: 0 };
@@ -167,15 +186,89 @@ test("a frozen computer reports stopped and start boots it without creating anot
   assert.equal((await computer.snapshot(owner)).status, "running");
 });
 
-test("stop freezes only a running computer; suspended counts as running", async () => {
+test("stop wakes a suspended computer first, since Orgo stops only a running one", async () => {
   const f = fake();
   const { computer, owner, desktop, labels: own } = service(f, { status: "suspended" });
   assert.equal(await desktop.state(own), "running");
   await computer.stop(owner);
+  assert.deepEqual(
+    f.calls.bash.map((call) => call.command),
+    ["true"],
+  );
   assert.deepEqual(f.calls.stop, ["pre"]);
   assert.equal(await desktop.state(own), "stopped");
   await computer.stop(owner);
   assert.equal(f.calls.stop.length, 1);
+});
+
+test("a suspended computer that does not wake is reported, not stopped blindly", async () => {
+  const f = fake({ staysSuspended: true });
+  const { computer, owner, desktop, labels: own } = service(f, { status: "suspended" });
+  await assert.rejects(computer.stop(owner), { status: 503, message: /did not wake/ });
+  assert.equal(f.calls.stop.length, 0);
+  assert.equal(await desktop.state(own), "running");
+});
+
+test("creating, restarting and updating computers refuse work, Start and Stop", async () => {
+  for (const status of ["creating", "restarting", "updating"]) {
+    const f = fake();
+    const { computer, owner, desktop, labels: own } = service(f, { status });
+    const busy = { status: 409, message: new RegExp(`is ${status}`) };
+    await assert.rejects(desktop.inspect(own), busy);
+    await assert.rejects(computer.execute(owner, { command: "echo hi" }), busy);
+    await assert.rejects(computer.desktopAction(owner, { action: "screenshot" }), busy);
+    await assert.rejects(computer.start(owner), busy);
+    await assert.rejects(computer.stop(owner), busy);
+    assert.equal((await computer.snapshot(owner)).status, "error");
+    assert.deepEqual([f.calls.bash, f.calls.start, f.calls.stop, f.calls.create], [[], [], [], []]);
+    assert.equal(f.calls.screenshots, 0);
+  }
+  const unknown = service(fake(), { status: "hibernating" });
+  await assert.rejects(unknown.desktop.inspect(unknown.labels), {
+    status: 502,
+    message: /unknown status/,
+  });
+});
+
+test("Stop keeps the lease while Orgo is still stopping, so no command runs meanwhile", async (t) => {
+  let release = () => {};
+  const f = fake({ stopGate: new Promise<void>((done) => (release = done)) });
+  const { computer, owner } = service(f, {});
+  t.mock.timers.enable({ apis: ["Date", "setInterval"] });
+  const stopping = computer.stop(owner);
+  while (!f.calls.stop.length) await new Promise((done) => setImmediate(done));
+  // Past one lease (180 s): the renewals keep it held.
+  for (let minute = 0; minute < 4; minute++) {
+    t.mock.timers.tick(60_000);
+    for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done));
+  }
+  await assert.rejects(computer.execute(owner, { command: "echo ran during stop" }), {
+    status: 409,
+  });
+  await assert.rejects(computer.desktopAction(owner, { action: "screenshot" }), { status: 409 });
+  assert.equal(f.calls.bash.length, 0);
+  release();
+  assert.equal((await stopping).status, "stopped");
+  t.mock.timers.reset();
+});
+
+test("an operation Orgo has not settled keeps work away after the lease ends", async () => {
+  let unsettled = true;
+  const f = fake({ pending: () => unsettled });
+  const { computer, owner } = service(f, {});
+  await assert.rejects(computer.execute(owner, { command: "echo hi" }), {
+    status: 409,
+    message: /still starting or stopping/,
+  });
+  // The snapshot still shows what Orgo reports.
+  assert.equal((await computer.snapshot(owner)).status, "running");
+  assert.equal(f.calls.bash.length, 0);
+  unsettled = false;
+  assert.equal((await computer.execute(owner, { command: "echo hi" })).status, "succeeded");
+  // A second Stop waits for Orgo too instead of stacking another operation.
+  unsettled = true;
+  await assert.rejects(computer.stop(owner), { status: 409, message: /still starting/ });
+  assert.equal(f.calls.stop.length, 0);
 });
 
 test("auto-stop is best effort: a plan without it still starts", async () => {
@@ -190,7 +283,7 @@ test("a computer in an error state is refused, and driver failures surface as th
   await assert.rejects(failing.desktop.inspect(failing.labels), { status: 502 });
   const broken = new OrgoDesktopComputer(config, {
     ...f.driver,
-    find: async () => {
+    list: async () => {
       throw new Error("network down");
     },
   });
@@ -199,6 +292,15 @@ test("a computer in an error state is refused, and driver failures surface as th
     assert.equal((error as { status?: number }).status, 503);
     return true;
   });
+});
+
+test("attaching fails closed on two computers with this owner's name", async () => {
+  const f = fake();
+  const { computer, owner, desktop, labels: own, name } = service(f, {});
+  f.computers.set("twin", { id: "twin", name, status: "running" });
+  await assert.rejects(desktop.inspect(own), { status: 409, message: /refusing to attach/ });
+  await assert.rejects(computer.start(owner), { status: 409 });
+  assert.equal(f.calls.create.length, 0);
 });
 
 test("the wrapper separates stdout, stderr and the exit code, and keeps quoting", async () => {
@@ -360,9 +462,17 @@ test("sideways scroll and a click at the pointer fall back to xdotool on the boo
 test("a lost input response is an uncertain receipt, and a failed screenshot keeps the input succeeded", async () => {
   const lost = fake({ inputFails: true });
   const a = service(lost, {});
-  const uncertain = await a.computer.desktopAction(a.owner, { action: "key", text: "Return" });
+  const options = { idempotencyKey: "key-once" };
+  const action = { action: "key", text: "Return" };
+  const uncertain = await a.computer.desktopAction(a.owner, action, options);
   assert.equal(uncertain.receipt.status, "interrupted");
   assert.match(uncertain.warning ?? "", /outcome is unknown/);
+  // Never replayed: one dispatch, and the same operation ID sends nothing new.
+  assert.equal(lost.calls.inputs.length, 1);
+  const again = await a.computer.desktopAction(a.owner, action, options);
+  assert.equal(again.receipt.id, uncertain.receipt.id);
+  assert.match(again.warning ?? "", /no new desktop input was sent/);
+  assert.equal(lost.calls.inputs.length, 1);
   const noShot = fake({ screenshotFails: true });
   const b = service(noShot, {});
   const delivered = await b.computer.desktopAction(b.owner, { action: "type", text: "x" });
@@ -420,8 +530,8 @@ test("the REST driver sends the documented requests with the key as a bearer tok
       return respond(String(url));
     },
   );
-  assert.deepEqual(await driver.find("n1"), { id: "c1", name: "n1", status: "running" });
-  assert.equal(await driver.find("other"), undefined);
+  assert.deepEqual(await driver.list("n1"), [{ id: "c1", name: "n1", status: "running" }]);
+  assert.deepEqual(await driver.list("other"), []);
   assert.equal(await driver.create("n2"), "c2");
   assert.deepEqual(await driver.bash("c1", "echo hi", 12), { output: "hi\n", exitCode: 0 });
   await driver.start("c1");
@@ -438,8 +548,8 @@ test("the REST driver sends the documented requests with the key as a bearer tok
     "GET /workspaces/ws-1",
     "POST /computers",
     "POST /computers/c1/bash",
-    "POST /computers/c1/start",
-    "POST /computers/c1/stop",
+    "POST /computers/c1/start?async=true",
+    "POST /computers/c1/stop?async=true",
     "PATCH /computers/c1/resize",
     "POST /computers/c1/click",
     "GET /computers/c1/screenshot?response_format=binary&format=jpeg&quality=80",
@@ -464,5 +574,89 @@ test("the REST driver sends the documented requests with the key as a bearer tok
   assert.equal(form.get("desktopId"), "c1");
   assert.equal(form.get("workspaceId"), "ws-1");
   const failing = orgoDriver(config, async () => new Response("no", { status: 401 }));
-  await assert.rejects(failing.find("x"), /Orgo returned 401/);
+  await assert.rejects(failing.list("x"), /Orgo returned 401/);
+});
+
+test("start and stop wait for Orgo's operation instead of treating 202 as done", async () => {
+  const seen: string[] = [];
+  const polls: Record<string, string[]> = {
+    "op-start": ["queued", "running", "succeeded"],
+    "op-stop": ["running", "needs_review"],
+  };
+  const driver = orgoDriver(
+    config,
+    async (url, init) => {
+      const path = String(url).replace("https://www.orgo.ai/api", "");
+      seen.push(`${init?.method ?? "GET"} ${path}`);
+      if (path === "/computers/c1/start?async=true")
+        return Response.json({ operation_id: "op-start" }, { status: 202 });
+      if (path === "/computers/c1/stop?async=true")
+        return Response.json({ operation_id: "op-stop" }, { status: 202 });
+      // Already in the requested state: Orgo answers 200 and starts no operation.
+      if (path === "/computers/c2/start?async=true") return Response.json({ success: true });
+      const op = path.match(/\/operations\/(op-[a-z]+)$/)?.[1];
+      if (op) return Response.json({ status: polls[op].shift() });
+      return new Response("unexpected", { status: 500 });
+    },
+    1,
+  );
+  await driver.start("c1");
+  assert.deepEqual(seen.splice(0), [
+    "POST /computers/c1/start?async=true",
+    "GET /computers/c1/operations/op-start",
+    "GET /computers/c1/operations/op-start",
+    "GET /computers/c1/operations/op-start",
+  ]);
+  assert.equal(await driver.pending("c1"), false);
+  await assert.rejects(driver.stop("c1"), /needs_review/);
+  // needs_review stays pending until Orgo settles it.
+  polls["op-stop"].push("needs_review", "succeeded");
+  assert.equal(await driver.pending("c1"), true);
+  assert.equal(await driver.pending("c1"), false);
+  assert.equal(await driver.pending("c1"), false);
+  assert.equal(seen.filter((call) => call.endsWith("/op-stop")).length, 4);
+  await driver.start("c2");
+  assert.deepEqual(seen.at(-1), "POST /computers/c2/start?async=true");
+});
+
+test("start and stop end at their deadline, and fail on failed or missing operations", async () => {
+  let poll: (signal: AbortSignal) => Promise<Response> = async () =>
+    Response.json({ status: "running" });
+  const driver = orgoDriver(
+    config,
+    async (url, init) => {
+      const path = String(url).replace("https://www.orgo.ai/api", "");
+      if (path === "/computers/c1/stop?async=true")
+        return Response.json({ operation_id: "op-1" }, { status: 202 });
+      if (path === "/computers/c2/stop?async=true") return new Response("{}", { status: 202 });
+      return poll(init?.signal as AbortSignal);
+    },
+    5,
+    200,
+  );
+  const timed = async (work: Promise<unknown>, pattern: RegExp) => {
+    const begun = Date.now();
+    await assert.rejects(work, pattern);
+    return Date.now() - begun;
+  };
+  // Running forever: the wait ends at the budget, and the operation stays pending.
+  assert.ok((await timed(driver.stop("c1"), /still running/)) < 1000);
+  assert.equal(await driver.pending("c1"), true);
+  // A poll that answers only after the deadline is cut off, not accepted late.
+  poll = (signal) =>
+    new Promise((_, fail) => signal.addEventListener("abort", () => fail(signal.reason)));
+  // AbortSignal.timeout does not hold the event loop open; a server would.
+  const awake = setInterval(() => {}, 20);
+  const late = await timed(driver.stop("c1"), /timeout|abort/i).finally(() => clearInterval(awake));
+  assert.ok(late >= 150 && late < 1000, String(late));
+  // A success decoded after the deadline is not accepted late either.
+  poll = async () => {
+    await new Promise((done) => setTimeout(done, 250));
+    return Response.json({ status: "succeeded" });
+  };
+  await assert.rejects(driver.stop("c1"), /still running/);
+  poll = async () => Response.json({ status: "failed" });
+  await assert.rejects(driver.stop("c1"), /ended as failed/);
+  assert.equal(await driver.pending("c1"), false);
+  await assert.rejects(driver.stop("c2"), /no stop operation/);
 });

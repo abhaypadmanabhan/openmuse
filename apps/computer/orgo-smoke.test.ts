@@ -91,7 +91,10 @@ test("real Orgo computer runs commands, opens GUI apps, acts, persists files and
     assert.equal(started.status, "running");
     assert.equal(started.provider, "orgo");
     assert.equal(started.network, "enabled");
-    assert.equal((await driver.find(name))?.status, "running");
+    assert.deepEqual(
+      (await driver.list(name)).map((item) => item.status),
+      ["running"],
+    );
     const command = await post("/commands", {
       command:
         "pwd; python3 --version; git --version; printf 'persisted from bash\\n' > receipt.txt; echo oops >&2",
@@ -137,6 +140,13 @@ test("real Orgo computer runs commands, opens GUI apps, acts, persists files and
     assert.match(await pointer(), /^x:640 y:400 /);
     await act({ action: "mouse_move", coordinate: [100, 120] });
     assert.match(await pointer(), /^x:100 y:120 /);
+    await act({ action: "double_click", coordinate: [300, 300] });
+    assert.match(await pointer(), /^x:300 y:300 /);
+    await act({ action: "right_click", coordinate: [640, 400] });
+    assert.match(await pointer(), /^x:640 y:400 /);
+    await act({ action: "key", text: "Escape" });
+    await act({ action: "scroll", coordinate: [500, 300], scroll_direction: "down" });
+    assert.match(await pointer(), /^x:500 y:300 /);
     // Typed input reaches a focused terminal window and runs there.
     await post("/commands", { command: "xfce4-terminal >/dev/null 2>&1 & sleep 3" });
     await act({ action: "type", text: "touch /workspace/typed" });
@@ -177,7 +187,10 @@ test("real Orgo computer runs commands, opens GUI apps, acts, persists files and
     assert.equal(slow.exitCode, 124);
     assert.equal((await call("")).status, "running");
     assert.equal((await post("/stop")).status, "stopped");
-    assert.equal((await driver.find(name))?.status, "frozen");
+    assert.deepEqual(
+      (await driver.list(name)).map((item) => item.status),
+      ["frozen"],
+    );
     assert.equal((await post("/start")).status, "running");
     assert.equal(
       (await post("/files/read", { path: "/workspace/receipt.txt" })).text,
@@ -186,9 +199,24 @@ test("real Orgo computer runs commands, opens GUI apps, acts, persists files and
     // Stop ends processes: the desktop is back, the old browser is not.
     assert.equal((await post("/commands", { command: "pgrep -x chrome" })).status, "failed");
     await act({ action: "screenshot" });
-    // A stopped computer refuses desktop actions instead of resuming.
+    // Stop during a running command ends it and freezes the computer.
+    const [running] = await driver.list(name);
+    const pending = server.computer.execute(owner, {
+      command: "printf ready > /workspace/.smoke-running; sleep 30",
+    });
+    const deadline = Date.now() + 15000;
+    while (true) {
+      const probe = await driver
+        .bash(running.id, "cat /workspace/.smoke-running", 10)
+        .catch(() => undefined);
+      if (probe?.output.trim() === "ready") break;
+      assert.ok(Date.now() < deadline, "command process failed to begin");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
     await server.computer.stop(owner);
+    assert.equal((await pending).status, "interrupted");
     assert.equal((await server.computer.snapshot(owner)).status, "stopped");
+    // A stopped computer refuses desktop actions instead of resuming.
     const refused = await server.app.request("/api/computer/desktop/actions", {
       method: "POST",
       headers,
@@ -201,8 +229,7 @@ test("real Orgo computer runs commands, opens GUI apps, acts, persists files and
       ),
     );
   } finally {
-    const found = await driver.find(name);
-    if (found) {
+    for (const found of await driver.list(name)) {
       const response = await fetch(
         `${config.orgoBaseUrl ?? "https://www.orgo.ai/api"}/computers/${found.id}`,
         { method: "DELETE", headers: { Authorization: `Bearer ${apiKey}` } },

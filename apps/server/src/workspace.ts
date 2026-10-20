@@ -365,6 +365,8 @@ export class WorkspaceService {
         configured: agentConfigured(this.config),
         openbotConfigured: false,
         richThreads: true,
+        // The computer service treats an unset provider as Docker.
+        computerProvider: this.config.computerProvider ?? "docker",
       },
     };
   }
