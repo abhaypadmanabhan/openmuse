@@ -5,7 +5,7 @@ import {
   type DockerResult,
   type DockerRunner,
 } from "./computer.ts";
-import { desktopCommand, type E2BDesktopComputer } from "./computer-e2b-desktop.ts";
+import { type DesktopAction, desktopCommand } from "./computer-e2b-desktop.ts";
 import type { ComputerProvider, Config } from "./config.ts";
 import { AppError } from "./errors.ts";
 
@@ -323,14 +323,58 @@ export class DockerComputer implements ComputerBackend {
   }
 }
 
+export interface DesktopStatus {
+  state: "running" | "paused";
+}
+/** What a desktop provider (E2B Desktop or Orgo) offers the service. */
+export interface DesktopComputer {
+  inspect(labels: Record<string, string>): Promise<DesktopStatus | undefined>;
+  state(labels: Record<string, string>): Promise<ComputerState>;
+  start(labels: Record<string, string>): Promise<void>;
+  stop(labels: Record<string, string>): Promise<void>;
+  desktopUrl(
+    labels: Record<string, string>,
+    firstConnect?: <T>(work: () => Promise<T>) => Promise<T>,
+  ): Promise<string>;
+  act(
+    labels: Record<string, string>,
+    action: DesktopAction,
+    beforeInput?: () => Promise<void>,
+  ): Promise<{
+    mimeType: "image/jpeg";
+    width: number;
+    height: number;
+    image: Uint8Array;
+    uncertain: boolean;
+    warning?: string;
+  }>;
+  run(
+    labels: Record<string, string>,
+    command: string,
+    options: {
+      cwd?: string;
+      input?: string;
+      timeoutMs: number;
+      signal?: AbortSignal;
+      maxOutputBytes?: number;
+      propagateAttachError?: boolean;
+      verified?: DesktopStatus;
+    },
+  ): Promise<DockerResult>;
+}
+
 export class DesktopComputerBackend implements ComputerBackend {
-  readonly provider = "e2b-desktop";
-  readonly receipts = "computer-desktop-commands";
+  readonly receipts: string;
   readonly network = "enabled";
   constructor(
     private readonly config: Config,
-    private readonly desktop: E2BDesktopComputer,
-  ) {}
+    private readonly desktop: DesktopComputer,
+    readonly provider: Exclude<ComputerProvider, "docker"> = "e2b-desktop",
+  ) {
+    // E2B keeps its original store name so existing receipts stay visible.
+    this.receipts =
+      provider === "e2b-desktop" ? "computer-desktop-commands" : `computer-${provider}-commands`;
+  }
   private labels(owner: string) {
     return computerIdentity(this.config, owner).labels;
   }

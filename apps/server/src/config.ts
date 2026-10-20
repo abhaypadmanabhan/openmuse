@@ -57,11 +57,14 @@ export interface Config {
   computerProvider?: ComputerProvider;
   computerE2bTemplate?: string;
   e2bApiKey?: string;
+  orgoApiKey?: string;
+  orgoWorkspaceId?: string;
+  orgoBaseUrl?: string;
   allowedOrigins: string[];
   trustProxy?: boolean;
 }
 
-export type ComputerProvider = "docker" | "e2b-desktop";
+export type ComputerProvider = "docker" | "e2b-desktop" | "orgo";
 
 /** Pinned so live rankings do not shift when TypeSafe moves the `jev-latest` alias. */
 export const defaultJevModel = "jev-1.13.0";
@@ -118,9 +121,28 @@ export function readConfig(): Config {
   if (jevMode === "live" && !typesafeApiKey)
     throw new Error("JEV_MODE=live requires a nonblank TYPESAFE_API_KEY");
   const computerProvider = process.env.COMPUTER_PROVIDER?.trim() || "docker";
-  if (computerProvider !== "docker" && computerProvider !== "e2b-desktop")
-    throw new Error("COMPUTER_PROVIDER must be docker or e2b-desktop");
+  if (
+    computerProvider !== "docker" &&
+    computerProvider !== "e2b-desktop" &&
+    computerProvider !== "orgo"
+  )
+    throw new Error("COMPUTER_PROVIDER must be docker, e2b-desktop or orgo");
   const e2bApiKey = process.env.E2B_API_KEY?.trim();
+  const orgoApiKey = process.env.ORGO_API_KEY?.trim();
+  const orgoWorkspaceId = process.env.ORGO_WORKSPACE_ID?.trim();
+  if (process.env.COMPUTER_ENABLED === "true" && computerProvider === "orgo") {
+    if (!orgoApiKey) throw new Error("COMPUTER_PROVIDER=orgo requires a nonblank ORGO_API_KEY");
+    if (!orgoWorkspaceId)
+      throw new Error(
+        "COMPUTER_PROVIDER=orgo requires ORGO_WORKSPACE_ID, the workspace that holds the computers",
+      );
+    // Computers are found by name across the whole workspace, and every default
+    // install would otherwise derive the same deployment hash from localhost:8787.
+    if (!process.env.COMPUTER_DEPLOYMENT_ID?.trim())
+      throw new Error(
+        "COMPUTER_PROVIDER=orgo requires a unique COMPUTER_DEPLOYMENT_ID, e.g. from `openssl rand -hex 12`",
+      );
+  }
   if (process.env.COMPUTER_ENABLED === "true" && computerProvider === "e2b-desktop") {
     if (!e2bApiKey)
       throw new Error("COMPUTER_PROVIDER=e2b-desktop requires a nonblank E2B_API_KEY");
@@ -163,6 +185,9 @@ export function readConfig(): Config {
     computerProvider,
     computerE2bTemplate: process.env.COMPUTER_E2B_TEMPLATE?.trim() || "desktop",
     e2bApiKey,
+    orgoApiKey,
+    orgoWorkspaceId,
+    orgoBaseUrl: process.env.ORGO_BASE_URL?.trim() || undefined,
     allowedOrigins: (
       process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
     ).split(","),
