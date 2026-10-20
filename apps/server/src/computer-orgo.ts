@@ -64,6 +64,8 @@ export interface OrgoDriver {
   upload(id: string, directory: string, filename: string, data: Uint8Array): Promise<void>;
   screenshot(id: string): Promise<Uint8Array>;
   input(id: string, action: OrgoInput, body: Record<string, unknown>): Promise<void>;
+  /** The desktop's VNC password. It can change, so it is fetched for each viewer session. */
+  vncPassword(id: string): Promise<string>;
 }
 
 class OrgoError extends Error {
@@ -232,7 +234,20 @@ export function orgoDriver(
     async input(id, action, body) {
       await json(`/computers/${id}/${action}`, "POST", body, 35_000);
     },
+    async vncPassword(id) {
+      const response = await request(`/computers/${id}/vnc-password`);
+      // A key with View only access to the workspace gets no password.
+      const { password } = (await response.json()) as { password?: string | null };
+      if (!password) throw new OrgoError(response.status, "Orgo returned no desktop password");
+      return password;
+    },
   };
+}
+
+/** Where Orgo streams every computer's desktop: the API host, over WebSocket. */
+export function orgoSocketOrigin(config: Pick<Config, "orgoBaseUrl">) {
+  const api = new URL(config.orgoBaseUrl ?? orgoBase);
+  return `${api.protocol === "http:" ? "ws:" : "wss:"}//${api.host}`;
 }
 
 // Orgo's shell endpoint has no stdin and returns stdout and stderr as one string, so
@@ -283,7 +298,7 @@ const loadFilesScript = () =>
 // computer whose name differs is the whole ownership check.
 export class OrgoDesktopComputer implements DesktopComputer {
   constructor(
-    config: Config,
+    private readonly config: Config,
     private readonly driver: OrgoDriver = orgoDriver(config),
   ) {}
   private name(labels: Record<string, string>) {
@@ -360,19 +375,21 @@ export class OrgoDesktopComputer implements DesktopComputer {
       await this.driver.upload(id, "/opt/openmuse", "files.py", Buffer.from(script));
     });
   }
+  // A suspended computer resumes on interaction, not through start: wake it with a
+  // no-op command and check. `step` names what needs it awake.
+  private async wake(labels: Record<string, string>, id: string, step: string) {
+    await this.control(() => this.driver.bash(id, "true", 30)).catch(() => undefined);
+    if ((await this.find(labels))?.kind !== "running")
+      throw new AppError(
+        `The Orgo computer is suspended and did not wake ${step}. Try again in a minute.`,
+        503,
+      );
+  }
   async stop(labels: Record<string, string>) {
     const info = await this.inspect(labels);
     if (info?.state !== "running") return;
-    // Orgo stops only a running computer, and a suspended one resumes on interaction,
-    // not through start. Wake it with a no-op command and check before archiving.
-    if (info.suspended) {
-      await this.control(() => this.driver.bash(info.id, "true", 30)).catch(() => undefined);
-      if ((await this.find(labels))?.kind !== "running")
-        throw new AppError(
-          "The Orgo computer is suspended and did not wake to stop. Try Stop again in a minute.",
-          503,
-        );
-    }
+    // Orgo stops only a running computer.
+    if (info.suspended) await this.wake(labels, info.id, "to stop");
     await this.control(() => this.driver.stop(info.id));
   }
   private async running(labels: Record<string, string>, verified?: DesktopStatus) {
@@ -382,11 +399,32 @@ export class OrgoDesktopComputer implements DesktopComputer {
       throw new AppError("Start the computer before using its terminal or files", 409);
     return info.id;
   }
-  async desktopUrl(): Promise<string> {
-    throw new AppError(
-      "Orgo computers have no embeddable live view yet. The agent can still see and use the desktop.",
-      503,
-    );
+  /** Orgo hosts no viewer page, so the link is OpenMuse's own viewer (`viewerLink`). The
+   * client asks again every 2 minutes, so this never wakes a suspended computer: only a
+   * viewer's connect does (`viewer`), and after Orgo's idle close that waits for input. */
+  async desktopUrl(
+    labels: Record<string, string>,
+    _firstConnect?: unknown,
+    viewerLink?: () => string,
+  ): Promise<string> {
+    if (!viewerLink) throw new AppError("The desktop viewer is not available", 503);
+    if ((await this.inspect(labels))?.state !== "running")
+      throw new AppError("Start the computer before opening its desktop", 409);
+    return viewerLink();
+  }
+  /** What OpenMuse's viewer page connects to. The password controls the whole computer
+   * (desktop, terminal and shell), so only the signed-in owner's viewer receives it. */
+  async viewer(labels: Record<string, string>) {
+    const info = await this.inspect(labels);
+    if (info?.state !== "running")
+      throw new AppError("Start the computer before opening its desktop", 409);
+    // Orgo's stream refuses a suspended computer (4003), so a connect wakes it.
+    if (info.suspended) await this.wake(labels, info.id, "for the desktop");
+    const password = await this.control(() => this.driver.vncPassword(info.id));
+    return {
+      socket: `${orgoSocketOrigin(this.config)}/desktops/${encodeURIComponent(info.id)}/ws/websockify`,
+      password,
+    };
   }
   /** Perform one GUI action and return the screenshot taken after it. */
   async act(

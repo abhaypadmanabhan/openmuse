@@ -1,21 +1,30 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import type { Auth } from "./auth.ts";
 import {
   type ComputerService,
   computerCommandSchema,
   computerPathSchema,
   computerWriteSchema,
 } from "./computer.ts";
+import { viewerLink, viewerPath } from "./computer-viewer.ts";
 import type { Files } from "./files.ts";
 
-export function computerRoutes(computer: ComputerService, files: Files) {
+export function computerRoutes(computer: ComputerService, files: Files, auth: Auth) {
   const app = new Hono<{ Variables: { owner: string } }>();
   app.get("/", async (c) => c.json(await computer.snapshot(c.get("owner"))));
   app.post("/start", async (c) => c.json(await computer.start(c.get("owner"))));
   app.post("/stop", async (c) => c.json(await computer.stop(c.get("owner"))));
-  // Live desktop stream (e2b-desktop provider). The URL carries a per-stream VNC
-  // password, never the E2B API key; repeated calls return the same stream.
-  app.get("/desktop", async (c) => c.json(await computer.desktopUrl(c.get("owner"))));
+  // Live desktop link. E2B's carries a per-stream VNC password, never the E2B API key;
+  // Orgo's opens OpenMuse's own viewer page with a signed 15-minute credential in its
+  // fragment (computer-viewer.ts).
+  app.get("/desktop", async (c) => {
+    const owner = c.get("owner");
+    return c.json(await computer.desktopUrl(owner, () => viewerLink(auth.sign(owner, viewerPath))));
+  });
+  // The viewer page POSTs its signed credential here for the socket and password, on every
+  // connect, so the password never appears in a URL or the page source.
+  app.post("/desktop/viewer", async (c) => c.json(await computer.desktopViewer(c.get("owner"))));
   // The same actions as the agent's use_desktop tool; the response omits the image.
   app.post("/desktop/actions", async (c) => {
     const { receipt, width, height, warning } = await computer.desktopAction(

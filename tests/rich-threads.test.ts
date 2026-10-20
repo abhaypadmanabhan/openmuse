@@ -196,7 +196,5 @@ test("workspace reports Rich Threads configuration without disclosing the projec
   const response = await app.request("/api/workspace", { headers: headers() });
   const body = await response.text();
   assert.equal(JSON.parse(body).runtime.richThreads, true);
-  // Chat cards read the provider here to know whether a live desktop view exists.
-  assert.equal(JSON.parse(body).runtime.computerProvider, "docker");
   assert.ok(!body.includes("test-project-key-never-sent"));
 });

@@ -22,6 +22,7 @@ import type {
 } from "../../../packages/domain/src/computer";
 import { useComputerDraft } from "./computer-drafts";
 import { DesktopStream } from "./desktop-stream";
+import { hasDesktop } from "./desktop-view";
 import { Button, Card, colors, Empty, ErrorNotice, Field, LinkRow, s, timeLabel } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -300,7 +301,7 @@ export function LinuxWorkspace({
           <View style={{ display: tab === "Files" ? "flex" : "none" }}>
             <ComputerFiles running={!!running} active={tab === "Files"} />
           </View>
-          {snapshot.provider === "e2b-desktop" && tab === "Desktop" && (
+          {hasDesktop(snapshot.provider) && tab === "Desktop" && (
             <ComputerDesktop running={!!running} />
           )}
         </>

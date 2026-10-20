@@ -9,6 +9,7 @@ export default function BrowserConsole({
   url: string;
   title?: string;
   sandboxed?: boolean;
+  inPlace?: boolean;
 }) {
   const [error, setError] = useState("");
   return (

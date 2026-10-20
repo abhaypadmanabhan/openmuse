@@ -16,7 +16,9 @@ import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
+import type { DesktopComputer } from "./computer-backend.ts";
 import { computerRoutes } from "./computer-routes.ts";
+import { viewerAssets } from "./computer-viewer.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
@@ -30,7 +32,7 @@ import { WorkspaceService } from "./workspace.ts";
 export async function createApp(
   db: Store,
   config: Config,
-  options: { docker?: DockerRunner } = {},
+  options: { docker?: DockerRunner; desktop?: DesktopComputer } = {},
 ) {
   assertApiDeploymentConfig(config);
   const auth = await createAuth(db, config),
@@ -45,7 +47,7 @@ export async function createApp(
     connection: (owner) => workspace.connection(owner),
   });
   const browser = new BrowserService(db, config, auth, files);
-  const computer = new ComputerService(db, config, options.docker);
+  const computer = new ComputerService(db, config, options.docker, options.desktop);
   const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
   const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
   const runtime = makeRuntime(config, agent, auth, intelligence);
@@ -95,6 +97,8 @@ export async function createApp(
       502,
     );
   });
+  // Public viewer page, script and noVNC modules; the credential route is under /api.
+  app.route("/", viewerAssets(config));
   app.get("/api/health", (c) =>
     c.json({
       ok: true,
@@ -132,7 +136,7 @@ export async function createApp(
   });
   app.use("/api/*", async (c, next) => {
     const signedRoute =
-      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
+      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$|^\/api\/computer\/desktop\/viewer$/.test(
         c.req.path,
       );
     const owner =
@@ -157,7 +161,7 @@ export async function createApp(
     return c.json(snapshot);
   });
   app.route("/api/agent", agentRoutes(agent));
-  app.route("/api/computer", computerRoutes(computer, files));
+  app.route("/api/computer", computerRoutes(computer, files, auth));
   app.get("/api/calendars", async (c) => c.json(await workspace.calendars(c.get("owner"))));
   app.get("/api/calendar/events", async (c) => {
     const query = z

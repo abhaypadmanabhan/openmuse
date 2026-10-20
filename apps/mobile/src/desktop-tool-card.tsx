@@ -5,7 +5,6 @@ import { z } from "zod";
 import type { ComputerSnapshot } from "../../../packages/domain/src/computer";
 import { useComputerDraft } from "./computer-drafts";
 import { DesktopStream } from "./desktop-stream";
-import { desktopView } from "./desktop-view";
 import { Button, Card, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -24,49 +23,8 @@ function parse(result: unknown) {
   }
 }
 
-/** The step's saved screenshot. A web image cannot send the Authorization header, so web
- * fetches the bytes and shows them from a blob URL. */
-function StepScreenshot({ receiptId }: { receiptId: string }) {
-  const { api } = useWorkspace();
-  const path = api.url(`/api/computer/desktop/screenshot?receipt=${receiptId}`);
-  const [blob, setBlob] = useState("");
-  useEffect(() => {
-    if (Platform.OS !== "web") return;
-    let alive = true,
-      url = "";
-    void fetch(path, { headers: { Authorization: `Bearer ${api.token}` } })
-      .then(async (response) => {
-        if (!response.ok) return;
-        url = URL.createObjectURL(await response.blob());
-        if (alive) setBlob(url);
-        else URL.revokeObjectURL(url);
-      })
-      .catch(() => {
-        /* A newer step replaced this screenshot; the card shows none. */
-      });
-    return () => {
-      alive = false;
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [api, path]);
-  if (Platform.OS === "web" && !blob) return null;
-  return (
-    <Image
-      accessibilityLabel="Latest desktop screenshot"
-      source={
-        Platform.OS === "web"
-          ? { uri: blob }
-          : { uri: path, headers: { Authorization: `Bearer ${api.token}` } }
-      }
-      style={{ width: "100%", aspectRatio: 1.6, borderRadius: 12 }}
-      resizeMode="contain"
-    />
-  );
-}
-
 /** Chat card for the agent's use_desktop tool: the live desktop on web, the latest
- * screenshot on native and for Orgo, or an offline notice with Start when the computer
- * is stopped. */
+ * screenshot on native, or an offline notice with Start when the computer is stopped. */
 export function DesktopToolCard({
   result,
   live = false,
@@ -77,7 +35,7 @@ export function DesktopToolCard({
   result: unknown;
   loading: boolean;
 }) {
-  const { api, open, workspace } = useWorkspace();
+  const { api, open } = useWorkspace();
   const [, setTab] = useComputerDraft("tab");
   const latest = live;
   const value = parse(result);
@@ -118,8 +76,7 @@ export function DesktopToolCard({
       subscription.remove();
     };
   }, [api, latest, loading, starting, snapshot?.status]);
-  const view = desktopView(snapshot, Platform.OS, workspace.runtime.computerProvider);
-  const running = view.show === "stream" || view.show === "screenshot";
+  const running = snapshot?.status === "running";
   async function start() {
     setStarting(true);
     setError("");
@@ -162,30 +119,35 @@ export function DesktopToolCard({
           </Button>
         </View>
       ) : latest && running ? (
-        view.show === "stream" ? (
+        Platform.OS === "web" ? (
           <DesktopStream running />
         ) : (
           <>
-            {/* Keyed so a new step never shows the previous step's image. */}
             {!!value?.receiptId && (
-              <StepScreenshot key={value.receiptId} receiptId={value.receiptId} />
+              <Image
+                accessibilityLabel="Latest desktop screenshot"
+                source={{
+                  uri: api.url(`/api/computer/desktop/screenshot?receipt=${value.receiptId}`),
+                  headers: { Authorization: `Bearer ${api.token}` },
+                }}
+                style={{ width: "100%", aspectRatio: 1.6, borderRadius: 12 }}
+                resizeMode="contain"
+              />
             )}
-            {view.live && <DesktopStream running embed={false} />}
+            <DesktopStream running embed={false} />
           </>
         )
       ) : null}
-      {view.live && (
-        <Button
-          small
-          icon={Monitor}
-          onPress={() => {
-            setTab("Desktop");
-            open({ type: "computer" });
-          }}
-        >
-          Open in Desktop tab
-        </Button>
-      )}
+      <Button
+        small
+        icon={Monitor}
+        onPress={() => {
+          setTab("Desktop");
+          open({ type: "computer" });
+        }}
+      >
+        Open in Desktop tab
+      </Button>
     </Card>
   );
 }

@@ -15,6 +15,7 @@ import { browserAddress } from "./browser-address";
 import { useComputerDraft } from "./computer-drafts";
 import { computerStatus } from "./computer-status";
 import { LinuxWorkspace } from "./computer-workspace";
+import { hasDesktop } from "./desktop-view";
 import { Button, Card, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -126,7 +127,7 @@ export function ComputerSheet() {
   const onSnapshot = useCallback((snapshot: ComputerSnapshot) => {
     // A transient provider error keeps the last known state instead of closing the tab.
     if (snapshot.status !== "error")
-      setDesktop(snapshot.provider === "e2b-desktop" && snapshot.status === "running");
+      setDesktop(hasDesktop(snapshot.provider) && snapshot.status === "running");
   }, []);
   // A remembered Desktop tab falls back to Terminal while the desktop is off; the draft
   // keeps "Desktop", so the tab returns by itself once the computer runs again.

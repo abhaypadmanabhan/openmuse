@@ -13,6 +13,7 @@ import {
   type OrgoInput,
   orgoCommand,
   orgoDriver,
+  orgoSocketOrigin,
   orgoSplit,
 } from "../apps/server/src/computer-orgo.ts";
 import { computerInstructions, computerTools } from "../apps/server/src/computer-tools.ts";
@@ -43,6 +44,8 @@ function fake(
     /** A suspended computer ignores the wake-up command. */
     staysSuspended?: boolean;
     pending?: () => boolean;
+    /** What Orgo returns as the desktop password; null is a View only key's answer. */
+    password?: string | null;
   } = {},
 ) {
   const computers = new Map<string, OrgoInfo>();
@@ -55,6 +58,7 @@ function fake(
     uploads: [] as { directory: string; filename: string; bytes: number }[],
     screenshots: 0,
     inputs: [] as { action: OrgoInput; body: Record<string, unknown> }[],
+    passwords: [] as string[],
   };
   const add = (info: Partial<OrgoInfo>) => {
     const id = info.id ?? `cmp-${computers.size + 1}`;
@@ -126,6 +130,12 @@ function fake(
     async input(_id, action, body) {
       calls.inputs.push({ action, body });
       if (options.inputFails) throw new Error("connection reset");
+    },
+    async vncPassword(id) {
+      calls.passwords.push(id);
+      const password = options.password === undefined ? "vnc-pass-1" : options.password;
+      if (!password) throw new Error("Orgo returned no desktop password");
+      return password;
     },
   };
   return { driver, calls, computers };
@@ -483,13 +493,56 @@ test("a lost input response is an uncertain receipt, and a failed screenshot kee
   });
 });
 
-test("the live view is not offered, and says so", async () => {
+test("the live view is a freshly signed viewer link, refused while stopped", async () => {
   const f = fake();
-  const { computer, owner } = service(f, {});
-  await assert.rejects(computer.desktopUrl(owner), {
-    status: 503,
-    message: /no embeddable live view/,
+  const { computer, owner } = service(f, { status: "frozen" });
+  let signed = 0;
+  const link = () => `https://openmuse.test/viewer#n=${++signed}`;
+  await assert.rejects(computer.desktopUrl(owner, link), { status: 409, message: /Start/ });
+  (f.computers.get("pre") as OrgoInfo).status = "running";
+  assert.deepEqual(await computer.desktopUrl(owner, link), {
+    url: "https://openmuse.test/viewer#n=1",
   });
+  // Every request signs anew, so a held link is as old as its fetch (Open desktop relies on it).
+  assert.equal((await computer.desktopUrl(owner, link)).url, "https://openmuse.test/viewer#n=2");
+  // Without a link to hand out there is nothing to open.
+  await assert.rejects(computer.desktopUrl(owner), { status: 503 });
+  // The client asks for the link every 2 minutes: that never wakes a suspended computer,
+  // sends anything to it or fetches its password. Only a viewer's connect does.
+  (f.computers.get("pre") as OrgoInfo).status = "suspended";
+  assert.equal((await computer.desktopUrl(owner, link)).url, "https://openmuse.test/viewer#n=3");
+  assert.deepEqual([f.calls.bash.length, f.calls.passwords.length], [0, 0]);
+  assert.equal((f.computers.get("pre") as OrgoInfo).status, "suspended");
+});
+
+test("the viewer gets the Orgo stream and a fresh password, waking a suspended computer", async () => {
+  const f = fake();
+  const { computer, owner } = service(f, { status: "suspended" });
+  assert.deepEqual(await computer.desktopViewer(owner), {
+    socket: "wss://www.orgo.ai/desktops/pre/ws/websockify",
+    password: "vnc-pass-1",
+  });
+  // Orgo's stream refuses a suspended computer (4003), so it is woken first.
+  assert.deepEqual(
+    f.calls.bash.map((call) => call.command),
+    ["true"],
+  );
+  // Orgo can change the password: every connect asks again.
+  await computer.desktopViewer(owner);
+  assert.deepEqual(f.calls.passwords, ["pre", "pre"]);
+  // The stream is on the API's host: staging streams from staging.
+  assert.equal(
+    orgoSocketOrigin({ orgoBaseUrl: "https://staging.orgo.ai/api" }),
+    "wss://staging.orgo.ai",
+  );
+  assert.equal(orgoSocketOrigin({ orgoBaseUrl: "http://127.0.0.1:9/api" }), "ws://127.0.0.1:9");
+  const stopped = fake();
+  const off = service(stopped, { status: "frozen" });
+  await assert.rejects(off.computer.desktopViewer(off.owner), { status: 409 });
+  assert.equal(stopped.calls.passwords.length, 0);
+  // A View only key gets no password from Orgo: refused as the app's 503, not an empty one.
+  const viewOnly = service(fake({ password: null }), {});
+  await assert.rejects(viewOnly.computer.desktopViewer(viewOnly.owner), { status: 503 });
 });
 
 test("receipts are kept apart from Docker and E2B receipts", async () => {
@@ -521,6 +574,7 @@ test("the REST driver sends the documented requests with the key as a bearer tok
     if (url.endsWith("/computers")) return Response.json({ id: "c2" });
     if (url.includes("/screenshot")) return new Response(jpeg);
     if (url.endsWith("/bash")) return Response.json({ output: "hi\n", exit_code: 0 });
+    if (url.endsWith("/vnc-password")) return Response.json({ password: "vnc-pass-2" });
     return Response.json({ success: true });
   };
   const driver = orgoDriver(
@@ -540,6 +594,7 @@ test("the REST driver sends the documented requests with the key as a bearer tok
   await driver.input("c1", "click", { x: 1, y: 2 });
   assert.deepEqual([...(await driver.screenshot("c1"))], [...jpeg]);
   await driver.upload("c1", "/opt/openmuse", "files.py", Buffer.from("x"));
+  assert.equal(await driver.vncPassword("c1"), "vnc-pass-2");
   const calls = seen.map(
     (call) => `${call.init.method ?? "GET"} ${call.url.replace("https://orgo.test/api", "")}`,
   );
@@ -554,6 +609,7 @@ test("the REST driver sends the documented requests with the key as a bearer tok
     "POST /computers/c1/click",
     "GET /computers/c1/screenshot?response_format=binary&format=jpeg&quality=80",
     "POST /files/upload",
+    "GET /computers/c1/vnc-password",
   ]);
   assert.ok(
     seen.every(
@@ -575,6 +631,8 @@ test("the REST driver sends the documented requests with the key as a bearer tok
   assert.equal(form.get("workspaceId"), "ws-1");
   const failing = orgoDriver(config, async () => new Response("no", { status: 401 }));
   await assert.rejects(failing.list("x"), /Orgo returned 401/);
+  const viewOnly = orgoDriver(config, async () => Response.json({ password: null }));
+  await assert.rejects(viewOnly.vncPassword("c1"), /no desktop password/);
 });
 
 test("start and stop wait for Orgo's operation instead of treating 202 as done", async () => {

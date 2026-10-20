@@ -648,14 +648,25 @@ export class ComputerService {
       );
     return this.desktop;
   }
-  /** Desktop stream URL for the owner's running desktop (e2b-desktop provider; orgo has none yet).
-   * The first connection takes the lifecycle lease so it cannot race startup or Stop.
-   * Cached viewers only check the stream and never block commands or actions. */
-  async desktopUrl(owner: string) {
+  /** Desktop link for the owner's running desktop: E2B's stream, or OpenMuse's viewer page
+   * (`viewerLink`) for Orgo. E2B's first connection takes the lifecycle lease so it cannot
+   * race startup or Stop; cached viewers only check the stream and never block work. */
+  async desktopUrl(owner: string, viewerLink?: () => string) {
     const desktop = this.desktopOnly();
     return {
-      url: await desktop.desktopUrl(this.labels(owner), (work) => this.exclusive(owner, work)),
+      url: await desktop.desktopUrl(
+        this.labels(owner),
+        (work) => this.exclusive(owner, work),
+        viewerLink,
+      ),
     };
+  }
+  /** The socket and password OpenMuse's viewer page connects with (orgo). Fetched for each
+   * connect, never stored: Orgo can change the password. */
+  async desktopViewer(owner: string) {
+    const desktop = this.desktopOnly();
+    if (!desktop.viewer) throw new AppError("This computer has no OpenMuse viewer", 404);
+    return desktop.viewer(this.labels(owner));
   }
   /** One screenshot, click, key or typing action on the running desktop, recorded as a
    * receipt in a separate action history. A stopped computer fails; it is never resumed here. */

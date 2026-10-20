@@ -332,10 +332,14 @@ export interface DesktopComputer {
   state(labels: Record<string, string>): Promise<ComputerState>;
   start(labels: Record<string, string>): Promise<void>;
   stop(labels: Record<string, string>): Promise<void>;
+  /** The live desktop link: E2B's hosted page, or `viewerLink` for providers without one. */
   desktopUrl(
     labels: Record<string, string>,
     firstConnect?: <T>(work: () => Promise<T>) => Promise<T>,
+    viewerLink?: () => string,
   ): Promise<string>;
+  /** The VNC socket and password OpenMuse's own viewer page connects with (Orgo). */
+  viewer?(labels: Record<string, string>): Promise<{ socket: string; password: string }>;
   act(
     labels: Record<string, string>,
     action: DesktopAction,

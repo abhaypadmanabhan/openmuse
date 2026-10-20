@@ -99,7 +99,7 @@ COMPUTER_DEPLOYMENT_ID=...     # required and unique per install, e.g. `openssl 
 # ORGO_BASE_URL=...            # only for a non-default Orgo API
 ```
 
-Open **Computer → Start computer**. The agent gets the same `use_desktop` tool as on E2B, and the terminal and Files tabs work as usual. The Desktop tab is not shown: Orgo has no embeddable live-view URL yet (see the differences below). The chat's Desktop card shows the screenshot each step saved, on web and native, with no **Open desktop** or **Open in Desktop tab** button. The latest screenshot is served at `GET /api/computer/desktop/screenshot`.
+Open **Computer → Start computer**. The agent gets the same `use_desktop` tool as on E2B, and the Desktop, terminal and Files tabs and the chat's Desktop card work as they do on E2B. Orgo hosts no viewer page, so the API serves its own. `GET /api/computer/desktop` returns a link to `/computer-viewer/desktop` that carries a signed credential, valid for 15 minutes and returned only to the signed-in owner, in its fragment (the part after `#`, which browsers never send to a server). The page runs [noVNC](https://github.com/novnc/noVNC) from the API host and, on each connect, posts the credential to `/api/computer/desktop/viewer` for the computer's Orgo stream address and VNC password, so the password is never in a URL, the page source or the app bundle. Treat the link as a bearer secret until it expires: anyone holding it gets full keyboard and mouse control. While the app shows the desktop it renews the credential by changing only the fragment, so the open viewer keeps its connection. The viewer reconnects by itself after a dropped connection; after 30 minutes without input from a viewer, Orgo closes the stream and the page waits for **Reconnect**. Connecting wakes a computer Orgo suspended for idleness; the app's background refresh does not.
 
 How it maps to the Docker contract:
 
@@ -142,7 +142,7 @@ The Orgo provider differs from Docker in these ways:
 
 - **Network access is on.** Commands can reach the internet and the app reports `network: enabled`. The same outbound-path warning as E2B applies: approval gating covers only the app's own email and calendar tools.
 - **Isolation comes from the VM**, one per owner. Commands run as `root` inside it, with no read-only root filesystem, capability drop or pids limit.
-- **No live view.** Every member of the Orgo workspace can watch the computer in the Orgo dashboard, and members with write access can also control it; OpenMuse does not embed the view, so no VNC credential reaches the client.
+- **The VNC password controls the whole computer.** Orgo's desktop password also opens its terminal and shell, and Orgo has no view-only password for an embed. Only the owner's viewer page receives it. Every member of the Orgo workspace can also watch the computer in the Orgo dashboard, and members with write access can control it.
 - **Aborting a command stops the whole computer.** Orgo's shell endpoint has no kill, so an aborted command, or one whose response is lost, is recorded as interrupted and the computer is stopped, as on Docker and E2B: every other command and desktop app on it ends too, and files are kept. If that Stop cannot be confirmed, the computer stays locked until a Stop succeeds.
 - **Files live with Orgo.** Workspace files are stored with Orgo, outside your host. Your Orgo plan's limits apply.
 

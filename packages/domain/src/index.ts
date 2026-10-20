@@ -195,8 +195,6 @@ export interface Workspace {
     configured: boolean;
     openbotConfigured: boolean;
     richThreads?: boolean;
-    /** Lets every chat card know whether the computer has a live desktop view. */
-    computerProvider?: "docker" | "e2b-desktop" | "orgo";
   };
 }
 

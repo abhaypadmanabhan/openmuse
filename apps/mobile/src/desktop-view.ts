@@ -1,16 +1,11 @@
 import type { ComputerSnapshot } from "../../../packages/domain/src/computer";
 
-/** What the chat's desktop card shows for the newest use_desktop step. Only E2B Desktop
- * has a live stream (embedded on web, a link on native); Orgo has none yet, so it shows
- * the screenshot the step saved, and no Desktop tab or Open desktop link. Older cards
- * have no snapshot and go by the workspace's configured provider. */
-export function desktopView(
-  snapshot: ComputerSnapshot | undefined,
-  os: string,
-  provider?: ComputerSnapshot["provider"],
-) {
-  const live = (snapshot?.provider ?? provider) !== "orgo";
-  if (!snapshot) return { show: "nothing", live } as const;
-  if (snapshot.status !== "running") return { show: "offline", live } as const;
-  return { show: live && os === "web" ? "stream" : "screenshot", live } as const;
-}
+/** Whether the computer has a live desktop and a Desktop tab: E2B hosts its viewer page,
+ * and the OpenMuse server serves one for Orgo. Docker has no desktop. */
+export const hasDesktop = (provider: ComputerSnapshot["provider"]) => provider !== "docker";
+
+/** The desktop link Open desktop may reuse. Orgo's viewer links last 15 minutes, so one
+ * fetched within the last 10 is opened straight from the press (a browser may block a tab
+ * opened after waiting on the network); an older one is fetched again. */
+export const reusableLink = (url: string, fetchedAt: number, now = Date.now()) =>
+  url && now - fetchedAt < 10 * 60_000 ? url : undefined;

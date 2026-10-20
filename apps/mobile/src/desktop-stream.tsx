@@ -1,7 +1,8 @@
 import { ExternalLink } from "lucide-react-native";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, AppState, Linking, Platform, View } from "react-native";
 import BrowserConsole from "./BrowserConsole";
+import { reusableLink } from "./desktop-view";
 import { Button, colors, ErrorNotice } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -17,6 +18,7 @@ export function useDesktopStream(running: boolean) {
   const { api } = useWorkspace();
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  const fetchedAt = useRef(0);
   useEffect(() => {
     if (!running) return;
     let alive = true,
@@ -31,6 +33,7 @@ export function useDesktopStream(running: boolean) {
         .then((value) => {
           if (!alive) return;
           loaded = true;
+          fetchedAt.current = Date.now();
           setUrl(value.url);
           setError("");
         })
@@ -59,7 +62,7 @@ export function useDesktopStream(running: boolean) {
       subscription.remove();
     };
   }, [api, running]);
-  return { url, error, setError };
+  return { url, fetchedAt, error, setError };
 }
 
 /** Web embeds the stream; native opens it in the system browser. Memoized on its
@@ -74,14 +77,15 @@ export const DesktopStream = memo(function DesktopStream({
 }) {
   const embedded = embed && Platform.OS === "web";
   const { api } = useWorkspace();
-  const { url, error, setError } = useDesktopStream(running && embedded);
+  const { url, fetchedAt, error, setError } = useDesktopStream(running && embedded);
   const [opening, setOpening] = useState(false);
   async function open() {
     setOpening(true);
     setError("");
     try {
       const target =
-        embedded && url ? url : (await api.request<{ url: string }>("/api/computer/desktop")).url;
+        (embedded && reusableLink(url, fetchedAt.current)) ||
+        (await api.request<{ url: string }>("/api/computer/desktop")).url;
       await Linking.openURL(target);
     } catch (e) {
       setError(message(e));
@@ -94,7 +98,7 @@ export const DesktopStream = memo(function DesktopStream({
       <ErrorNotice error={error} />
       {embedded && !url && !error && <ActivityIndicator color={colors.blueDark} />}
       {!!url && embed && Platform.OS === "web" && (
-        <BrowserConsole url={url} title="Computer desktop" sandboxed />
+        <BrowserConsole url={url} title="Computer desktop" sandboxed inPlace />
       )}
       {running && (!embedded || !!url) && (
         <Button
