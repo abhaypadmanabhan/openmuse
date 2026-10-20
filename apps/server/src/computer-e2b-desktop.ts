@@ -317,7 +317,7 @@ const screenshotFile = "/tmp/openmuse-screenshot.jpg";
 // A VNC viewer that loses focus mid-shortcut (e.g. Alt+Tab in the user's browser)
 // leaves that modifier held, and every later click, key and wheel event then becomes
 // a shortcut. Input actions release all modifiers first.
-const releaseModifiers =
+export const releaseModifiers =
   "xdotool keyup Shift_L Shift_R Control_L Control_R Alt_L Alt_R Super_L Super_R Meta_L Meta_R ISO_Level3_Shift";
 // Input, a short settle so the screen shows its effect, then a JPEG screenshot (about
 // 40 to 200 KB at 1280x800, small enough to send to the model on every action).

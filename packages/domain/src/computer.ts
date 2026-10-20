@@ -14,7 +14,7 @@ export interface ComputerCommand {
 }
 export interface ComputerSnapshot {
   enabled: boolean;
-  provider: "docker" | "e2b-desktop";
+  provider: "docker" | "e2b-desktop" | "orgo";
   status: "unconfigured" | "stopped" | "running" | "error";
   workspacePath: "/workspace";
   /** Docker runs with networking off; the E2B desktop needs internet for its GUI browser. */

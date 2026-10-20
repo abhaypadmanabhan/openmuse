@@ -300,7 +300,7 @@ export function LinuxWorkspace({
           <View style={{ display: tab === "Files" ? "flex" : "none" }}>
             <ComputerFiles running={!!running} active={tab === "Files"} />
           </View>
-          {snapshot.provider === "e2b-desktop" && tab === "Desktop" && (
+          {snapshot.provider !== "docker" && tab === "Desktop" && (
             <ComputerDesktop running={!!running} />
           )}
         </>

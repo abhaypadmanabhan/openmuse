@@ -17,6 +17,7 @@ import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
+import { computerViewer } from "./computer-viewer.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
@@ -95,6 +96,7 @@ export async function createApp(
       502,
     );
   });
+  app.route("/computer-viewer", computerViewer());
   app.get("/api/health", (c) =>
     c.json({
       ok: true,

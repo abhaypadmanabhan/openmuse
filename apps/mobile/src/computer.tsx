@@ -126,7 +126,7 @@ export function ComputerSheet() {
   const onSnapshot = useCallback((snapshot: ComputerSnapshot) => {
     // A transient provider error keeps the last known state instead of closing the tab.
     if (snapshot.status !== "error")
-      setDesktop(snapshot.provider === "e2b-desktop" && snapshot.status === "running");
+      setDesktop(snapshot.provider !== "docker" && snapshot.status === "running");
   }, []);
   // A remembered Desktop tab falls back to Terminal while the desktop is off; the draft
   // keeps "Desktop", so the tab returns by itself once the computer runs again.
