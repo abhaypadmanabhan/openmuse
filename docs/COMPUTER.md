@@ -96,6 +96,34 @@ When the agent uses `use_desktop`, the chat shows a **Desktop** card for each st
 
 The terminal runs bounded commands and displays their saved results. It is not an interactive PTY: full-screen terminal apps and prompts that require ongoing keyboard input are not supported. Write noninteractive scripts or edit files through the Files tab.
 
+### Run the computer on Orgo (optional)
+
+Each owner's computer can instead be an [Orgo](https://docs.orgo.ai) cloud computer: a Linux VM with a graphical desktop, Google Chrome, Python 3, Node and git. The API host needs no Docker engine. Create a dedicated Orgo workspace for OpenMuse and an API key for it, then set:
+
+```dotenv
+COMPUTER_ENABLED=true
+COMPUTER_PROVIDER=orgo
+ORGO_API_KEY=sk_live_...       # API and task worker only; never passed into the computer
+ORGO_WORKSPACE_ID=...          # the workspace that holds the computers (UUID)
+COMPUTER_DEPLOYMENT_ID=...     # required and unique per install, e.g. `openssl rand -hex 12`
+# ORGO_BASE_URL=...            # only for a non-default Orgo API
+```
+
+Open **Computer → Start computer**. The agent gets the same `use_desktop` tool as on E2B, and the terminal and Files tabs work as usual. The Desktop tab uses a locally served noVNC viewer connected to Orgo’s authenticated WebSocket. The agent's screenshots are kept per action and served at `GET /api/computer/desktop/screenshot`.
+
+How it maps to the Docker contract:
+
+- **One computer per owner and deployment**, selected by name in `ORGO_WORKSPACE_ID` and checked against the creation ID saved in the server data directory, the workspace and Linux OS. Ambiguous names and unrecorded or replaced computers are refused. Keep the data directory shared between API and task worker and preserve it across restarts. Orgo has no labels, so the name is `openmuse-<deployment hash>-<owner hash>`; use a workspace that OpenMuse owns. That is why `COMPUTER_DEPLOYMENT_ID` is required.
+- **`/workspace` persists; processes do not.** Stop is Orgo's stop: the disk is archived and the host released, every command and desktop app ends, and files are kept. Start restores the disk. Each takes about 40 seconds. A computer that Orgo suspended for idleness counts as running and wakes on its next action.
+- **Idle shutdown.** Start asks Orgo to suspend the computer after 15 idle minutes (`auto_stop_minutes`). A failed auto-stop setup fails Start visibly; press Stop if setup fails after provisioning. This is an idle suspension policy rather than E2B’s absolute deadline, and uses Orgo’s native wake-on-activity behavior.
+- **Commands** run as `root` in `/workspace`, with the same 30-second limit, exit code 124 on timeout and 128 KB output cap. Orgo's shell endpoint has no stdin and merges the two output streams, so every command runs inside a small wrapper that splits them again and feeds stdin from uploaded files. File operations reuse `apps/computer/files.py` this way; a PDF near the 10 MB limit goes up in 8 MB parts.
+- **GUI apps from the terminal.** The desktop is on display `:99`, so `google-chrome --no-sandbox https://copilotkit.ai >/dev/null 2>&1 &` opens on it. A backgrounded app does not keep the command open. Orgo's Chrome asks to accept Google's terms on its first launch; the agent or user accepts it once per computer.
+- **Desktop actions** use Orgo's click, type, key, scroll and mouse-move endpoints, then take a 1280x800 JPEG screenshot. Sideways scroll and a click or scroll at the current pointer have no endpoint and run through `xdotool` on the same display.
+- **Cancellation** sends TERM, then KILL, to the process group created for that command. A guest timeout remains active if the HTTP or cancellation request fails; the receipt reports uncertainty.
+- **Live viewer credentials** control one computer, including its terminal. The account API key stays on the server. The authenticated desktop route fetches the computer password per session and puts it in the viewer URL fragment; treat that URL as a secret. noVNC 1.7.0 is served locally, without a third-party CDN.
+- **Command history is per provider**, separate from Docker and E2B.
+- **Run the live test** with `COMPUTER_PROVIDER=orgo ORGO_API_KEY=... ORGO_WORKSPACE_ID=... pnpm test:computer:orgo`. Set `COMPUTER_PROVIDER=orgo` explicitly. It creates one computer in that workspace, exercises every path above and deletes the computer.
+
 ## Isolation and scope
 
 The workspace is a Docker container running as a nonroot user, with a read-only root filesystem, limited temporary storage and resources, dropped capabilities, and no added privileges. It receives no host directory mounts, Docker socket, model keys, Google tokens, or API access key. A named volume provides persistent `/workspace` storage.
@@ -110,5 +138,15 @@ The E2B desktop provider differs from Docker in these ways:
 - **Files live with E2B.** Workspace files are stored with E2B, outside your host. Your E2B plan's runtime limits apply.
 
 The E2B API key stays on the API host.
+
+The Orgo provider differs from Docker in these ways:
+
+- **Network access is on.** Commands can reach the internet and the app reports `network: enabled`. The same outbound-path warning as E2B applies: approval gating covers only the app's own email and calendar tools.
+- **Isolation comes from the VM**, one per owner. Commands run as `root` inside it, with no read-only root filesystem, capability drop or pids limit.
+- **Live desktop.** A local noVNC viewer receives only the per-computer credential through the authenticated desktop route. Anyone with Orgo workspace access can also watch or control the computer.
+- **Cancellation uses a guest process group.** If its control request fails, the receipt reports uncertainty and the guest timeout remains the backstop.
+- **Files live with Orgo.** Workspace files are stored with Orgo, outside your host. Your Orgo plan's limits apply.
+
+The Orgo API key stays on the API host.
 
 This is a self-hosted, single-owner computer environment. Docker isolation does not provide a dedicated operating-system VM or a hostile-tenant security guarantee. The optional Colima VM provides the Linux host on macOS; the application still manages a Docker container within it.

@@ -10,6 +10,7 @@ import type {
 } from "../../../packages/domain/src/computer.ts";
 import {
   type ComputerBackend,
+  type DesktopComputer,
   DesktopComputerBackend,
   DockerComputer,
 } from "./computer-backend.ts";
@@ -19,6 +20,7 @@ import {
   E2BDesktopComputer,
   resolution,
 } from "./computer-e2b-desktop.ts";
+import { OrgoDesktopComputer } from "./computer-orgo.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
@@ -182,21 +184,24 @@ type Lease = {
   executorDone: boolean;
   operation: "command" | "operation";
 };
+function desktopFor(config: Config): DesktopComputer | undefined {
+  if (config.computerProvider === "e2b-desktop") return new E2BDesktopComputer(config);
+  if (config.computerProvider === "orgo") return new OrgoDesktopComputer(config);
+  return undefined;
+}
 export class ComputerService {
   private readonly backend: ComputerBackend;
   constructor(
     readonly db: Store,
     readonly config: Config,
     docker: DockerRunner = runDocker,
-    // Set only for COMPUTER_PROVIDER=e2b-desktop; the Docker paths below never use it.
-    private readonly desktop: E2BDesktopComputer | undefined = config.computerProvider ===
-    "e2b-desktop"
-      ? new E2BDesktopComputer(config)
-      : undefined,
+    // Set only for the desktop providers (e2b-desktop, orgo); the Docker paths below never use it.
+    private readonly desktop: DesktopComputer | undefined = desktopFor(config),
   ) {
-    this.backend = desktop
-      ? new DesktopComputerBackend(config, desktop)
-      : new DockerComputer(config, docker);
+    this.backend =
+      desktop && config.computerProvider !== "docker"
+        ? new DesktopComputerBackend(config, desktop, config.computerProvider)
+        : new DockerComputer(config, docker);
   }
   // Receipts are kept per provider, so Docker history never shows up on the desktop.
   private get receipts() {
@@ -326,7 +331,9 @@ export class ComputerService {
         message:
           this.provider === "e2b-desktop"
             ? "Enable the E2B desktop computer on the server to use its desktop, terminal and workspace files."
-            : "Enable the Docker computer on the server to use its terminal and workspace files.",
+            : this.provider === "orgo"
+              ? "Enable the Orgo computer on the server to use its desktop, terminal and workspace files."
+              : "Enable the Docker computer on the server to use its terminal and workspace files.",
       };
     try {
       return { ...base, status: (await this.isRunning(owner)) ? "running" : "stopped" };
@@ -606,10 +613,13 @@ export class ComputerService {
   private desktopOnly() {
     this.enabled();
     if (!this.desktop)
-      throw new AppError("This computer has no desktop. Set COMPUTER_PROVIDER=e2b-desktop.", 404);
+      throw new AppError(
+        "This computer has no desktop. Set COMPUTER_PROVIDER=e2b-desktop or orgo.",
+        404,
+      );
     return this.desktop;
   }
-  /** Desktop stream URL for the owner's running E2B desktop (e2b-desktop provider only).
+  /** Desktop stream URL for the owner's running desktop (desktop providers).
    * The first connection takes the lifecycle lease so it cannot race startup or Stop.
    * Cached viewers only check the stream and never block commands or actions. */
   async desktopUrl(owner: string) {

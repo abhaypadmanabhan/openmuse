@@ -123,12 +123,16 @@ test("computer provider defaults to Docker and e2b-desktop requires a server-sid
     "E2B_API_KEY",
     "COMPUTER_E2B_TEMPLATE",
     "COMPUTER_DEPLOYMENT_ID",
+    "ORGO_API_KEY",
+    "ORGO_WORKSPACE_ID",
+    "ORGO_BASE_URL",
     "CPK_INTELLIGENCE_API_KEY",
   ];
   const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
-    for (const key of keys.slice(0, 5)) delete process.env[key];
+    for (const key of keys.filter((key) => key !== "CPK_INTELLIGENCE_API_KEY"))
+      delete process.env[key];
     assert.equal(readConfig().computerProvider, "docker");
     process.env.COMPUTER_PROVIDER = "k8s";
     assert.throws(() => readConfig(), /COMPUTER_PROVIDER/);
@@ -144,6 +148,19 @@ test("computer provider defaults to Docker and e2b-desktop requires a server-sid
     assert.equal(config.computerProvider, "e2b-desktop");
     assert.equal(config.computerE2bTemplate, "desktop");
     assert.equal(config.e2bApiKey, "fixture-key");
+    // Orgo needs its own key and workspace, and the same unique deployment id.
+    process.env.COMPUTER_PROVIDER = "orgo";
+    assert.throws(() => readConfig(), /ORGO_API_KEY/);
+    process.env.ORGO_API_KEY = "fixture-orgo-key";
+    assert.throws(() => readConfig(), /ORGO_WORKSPACE_ID/);
+    process.env.ORGO_WORKSPACE_ID = "fixture-workspace";
+    const orgo = readConfig();
+    assert.equal(orgo.computerProvider, "orgo");
+    assert.equal(orgo.orgoApiKey, "fixture-orgo-key");
+    assert.equal(orgo.orgoWorkspaceId, "fixture-workspace");
+    assert.equal(orgo.orgoBaseUrl, undefined);
+    delete process.env.COMPUTER_DEPLOYMENT_ID;
+    assert.throws(() => readConfig(), /COMPUTER_DEPLOYMENT_ID/);
   } finally {
     for (const [key, value] of Object.entries(old)) {
       if (value === undefined) delete process.env[key];
