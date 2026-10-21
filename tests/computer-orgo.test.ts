@@ -563,7 +563,9 @@ test("the agent sees use_desktop, and instructions describe the Orgo image witho
   const instructions = computerInstructions("orgo");
   assert.match(instructions, /use_desktop/);
   assert.match(instructions, /Google Chrome/);
-  assert.doesNotMatch(instructions, /Firefox|Xfce|Desktop tab|Orgo|E2B|Docker/);
+  // The user watches and takes over the same desktop, as on E2B.
+  assert.match(instructions, /watch and control the same desktop live from the app's Desktop tab/);
+  assert.doesNotMatch(instructions, /Firefox|Xfce|Orgo|E2B|Docker/);
 });
 
 test("the REST driver sends the documented requests with the key as a bearer token", async () => {
